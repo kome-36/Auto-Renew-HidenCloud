@@ -12,7 +12,8 @@ permissions:
 jobs:
   renew-hiden:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 登录带重试后耗时可能拉长（3 轮提交 × 最多 2 个会话），从 20 提到 60 分钟
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -20,7 +21,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
-
 
       - name: ⚙ 设置 Python
         uses: actions/setup-python@v6
@@ -50,6 +50,37 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
+      # app.py 只在续期流程跑完才发通知；登录阶段失败会直接退出、什么都不发。
+      # 这一步兜底：脚本失败/被取消时补发 TG 告警。
+      - name: 🚨 失败通知
+        if: failure() || cancelled()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "未配置 TG，跳过通知"; exit 0
+          fi
+          PROXY_ARG=""
+          if [ "${IS_PROXY:-false}" = "true" ] && [ -n "${PROXY_SERVER:-}" ]; then
+            PROXY_ARG="--proxy ${PROXY_SERVER}"
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          TEXT=$(printf '❌ HidenCloud 保活失败\n时间: %s\n日志: %s' "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" "$RUN_URL")
+          curl -s --max-time 25 $PROXY_ARG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" || true
+
+      # 登录失败时 app.py 会留下 login_*.png 截图，排障用
+      - name: 📸 上传诊断截图
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diag-${{ github.run_number }}
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 7
+
       # 更新时间到time.txt,避免6个月未更新导致工作流暂停
       - name: 🕒 更新时间
         run: |
@@ -63,7 +94,7 @@ jobs:
             git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
             git push origin main
           fi
-      
+
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
