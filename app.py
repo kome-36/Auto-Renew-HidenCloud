@@ -24,6 +24,9 @@ IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081"
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
+# 本地调试可设 HEADLESS=true；工作流走 Xvfb 虚拟屏，默认保持有头模式（更不易被识别）
+HEADLESS      = os.environ.get('HEADLESS', 'false').lower() == 'true'
+
 # Cloudflare 整页挑战 / Turnstile 组件共用的 iframe 选择器
 CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
 
@@ -366,7 +369,7 @@ def open_browser(p):
     if USING_PATCHRIGHT:
         browser = p.chromium.launch(
             channel="chrome",
-            headless=False,
+            headless=HEADLESS,
             args=['--disable-infobars'],
             proxy=proxy_arg,
         )
@@ -376,7 +379,7 @@ def open_browser(p):
     log("⚠️ 未安装 patchright（建议 pip install patchright），退回原生 playwright，过 Cloudflare 能力较弱")
     browser = p.chromium.launch(
         channel="chrome",
-        headless=False,
+        headless=HEADLESS,
         args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
     )
     ctx = browser.new_context(
@@ -399,6 +402,83 @@ def _is_logged_in(page):
         return True
     except Exception:
         return False
+
+def _login_page_error(page):
+    """抓取登录页上的错误提示（如 419 / 凭据错误 / 限流），便于诊断"""
+    try:
+        body = page.locator('body').inner_text(timeout=3000)
+    except Exception:
+        return ''
+    for line in body.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if not line:
+            continue
+        if any(k in low for k in ('expired', '419', 'do not match', 'credentials', 'too many', '错误', '失败', '过期', '过多')):
+            return line[:120]
+    return ''
+
+
+def _left_login(page):
+    """当前是否已离开登录页且不在安全验证页"""
+    try:
+        return "/auth/login" not in (page.url or "") and not _is_security_check_page(page)
+    except Exception:
+        return False
+
+
+def _fill_and_submit_login(page, note=""):
+    """填写账号密码 -> 等表单 Turnstile -> 点提交（含拟人化输入节奏与 token 自检）"""
+    log("⌨️ 输入账号密码...")
+    user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
+    pwd_input = page.locator('input[name="password"], input[type="password"]').first
+    try:
+        # 登录表单要等安全验证页通过后才会渲染
+        user_input.wait_for(state="visible", timeout=30000)
+    except Exception:
+        handle_cloudflare(page, timeout=120)
+        user_input.wait_for(state="visible", timeout=30000)
+    try:
+        # 逐字符输入：瞬间 fill 的输入节奏是明显的自动化特征。
+        # 先清空，避免上一轮残留文本被追加成错误凭据。
+        user_input.click(timeout=5000)
+        user_input.fill('', timeout=5000)
+        user_input.press_sequentially(EMAIL, delay=random.randint(60, 140))
+        pwd_input.click(timeout=5000)
+        pwd_input.fill('', timeout=5000)
+        pwd_input.press_sequentially(PASSWORD, delay=random.randint(60, 140))
+    except Exception:
+        user_input.fill(EMAIL, timeout=10000)
+        pwd_input.fill(PASSWORD, timeout=10000)
+    time.sleep(random.uniform(0.6, 1.5))
+    handle_cloudflare(page, timeout=60)
+
+    # 登录表单自带 Turnstile，提交前先等它的 token
+    if not solve_modal_turnstile(page, timeout=90):
+        log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
+
+    # 提交前确认表单里的 cf-turnstile-response 确实有值（空 token 提交必被服务端拒绝）
+    try:
+        tok_len = page.evaluate(
+            """() => {
+                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                return el && el.value ? el.value.length : 0;
+            }"""
+        )
+        if tok_len:
+            log(f"🔑 表单 Turnstile token 长度: {tok_len}")
+        else:
+            log("⚠️ 表单 Turnstile token 为空，提交大概率被服务端拒绝")
+    except Exception:
+        pass
+
+    log(f"🖱️ 点击登录按钮提交{note}...")
+    try:
+        page.click('button[type="submit"]', timeout=8000)
+    except Exception:
+        page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
+    return True
+
 
 def login(page):
     # 1. Cookie 登录尝试
@@ -434,62 +514,68 @@ def login(page):
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page, timeout=240)
         time.sleep(2)
-        
-        log("⌨️ 输入账号密码...")
-        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
-        user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
-        pwd_input = page.locator('input[name="password"], input[type="password"]').first
-        try:
-            # 登录表单要等安全验证页通过后才会渲染
-            user_input.wait_for(state="visible", timeout=30000)
-        except Exception:
-            handle_cloudflare(page, timeout=120)
-            user_input.wait_for(state="visible", timeout=30000)
-        user_input.fill(EMAIL, timeout=10000)
-        pwd_input.fill(PASSWORD, timeout=10000)
-        time.sleep(0.5)
-        handle_cloudflare(page, timeout=60)
 
-        # 登录表单自带 Turnstile，提交前先等它的 token
-        if not solve_modal_turnstile(page, timeout=90):
-            log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
-        
-        log("🖱️ 点击登录按钮提交...")
-        try:
-            page.click('button[type="submit"]', timeout=8000)
-        except Exception:
-            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
-        time.sleep(3)
-        handle_cloudflare(page, timeout=240)
-        nav_start = time.time()
-        navigated = False
-        while time.time() - nav_start < 120:
+        # 提交后若被整页挑战打断（POST 被 CF 拦下 / CSRF 过期），会话不会建立，
+        # 页面会退回登录页；此时重新加载登录页、重填再交，最多 3 轮。
+        # （Turnstile token 是一次性的，重试必须重新加载页面拿全新 token 与 CSRF）
+        for round_no in range(1, 4):
+            _fill_and_submit_login(page, f"（第 {round_no}/3 轮）")
+            submit_at = time.time()
+            time.sleep(3)
+            handle_cloudflare(page, timeout=240)
+
+            navigated = _left_login(page)
+            form_back = False
+            while not navigated and time.time() - submit_at < 150:
+                try:
+                    if _is_security_check_page(page) or _has_interstitial_iframe(page):
+                        handle_cloudflare(page, timeout=60)
+                        navigated = _left_login(page)
+                        continue
+                    # 仍停在登录页且无挑战：等够 30 秒后表单还在 = 本次提交被丢弃
+                    if time.time() - submit_at > 30 and page.locator('input[name="password"]').count() > 0:
+                        form_back = True
+                        break
+                    navigated = _left_login(page)
+                except Exception:
+                    pass
+                time.sleep(1)
+
+            if navigated:
+                page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+                handle_cloudflare(page, timeout=120)
+                page_title = page.title()
+                log(f"📝 当前Title: {page_title}")
+                if _is_logged_in(page):
+                    log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+                    return True
+                log("⚠️ 已离开登录页但未进入控制台，重新登录...")
+            else:
+                page_err = _login_page_error(page)
+                hint = f"（页面提示: {page_err}）" if page_err else ""
+                why = "表单重新出现（提交被丢弃）" if form_back else "仍停留在登录页"
+                log(f"⚠️ 第 {round_no} 轮提交后{why}{hint}，重填再试...")
+
             try:
-                if "/auth/login" not in page.url and not _is_security_check_page(page):
-                    navigated = True
-                    break
-                if _is_security_check_page(page) or _has_interstitial_iframe(page):
-                    handle_cloudflare(page, timeout=60)
+                page.screenshot(path=f"login_retry_{round_no}.png")
             except Exception:
                 pass
-            time.sleep(1)
-        if not navigated:
-            log("❌ 登录提交后未能完成跳转。")
-            page.screenshot(path="login_fail.png")
-            return False
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page, timeout=120)
-        page_title = page.title()
-        log(f"📝 当前Title: {page_title}")
-        if not _is_logged_in(page):
-            log("❌ 登录失败。")
-            return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
-        return True
+            if round_no < 3:
+                try:
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+                    handle_cloudflare(page, timeout=120)
+                    time.sleep(random.uniform(2, 5))
+                except Exception:
+                    pass
+
+        log("❌ 登录失败。")
+        page.screenshot(path="login_fail.png")
+        return False
     except Exception as e:
         log(f"❌ 登录异常: {e}")
         page.screenshot(path="login_fail.png")
         return False
+
 
 def get_server_id(page):
     try:
@@ -677,7 +763,34 @@ def main():
             log("🚀 启动反检测内核浏览器...") # 使用patchright 反检测内核
             browser, page = open_browser(p)
 
-            if not login(page):
+            login_ok = False
+            for attempt in range(1, 3):
+                if login(page):
+                    login_ok = True
+                    break
+                if attempt == 1:
+                    log("🔁 登录未成功，关闭当前会话、换新环境重试一次...")
+                    try:
+                        page.context.close()
+                    except Exception:
+                        pass
+                    time.sleep(random.uniform(3, 6))
+                    try:
+                        proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
+                        if USING_PATCHRIGHT:
+                            new_ctx = browser.new_context(viewport=None, proxy=proxy_arg)
+                        else:
+                            new_ctx = browser.new_context(
+                                viewport={'width': 1920, 'height': 1080},
+                                user_agent=DEFAULT_UA,
+                                proxy=proxy_arg,
+                            )
+                            new_ctx.add_init_script(STEALTH_JS)
+                        page = new_ctx.new_page()
+                    except Exception as e:
+                        log(f"⚠️ 重建会话失败: {e}")
+                        break
+            if not login_ok:
                 sys.exit(1)
 
             # 登录成功后，自动获取 Server ID
